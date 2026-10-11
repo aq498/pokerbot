@@ -24,7 +24,7 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # Auto-injected by R
 
 # Stop at 8k sims or 8s, whichever comes first
 MC_TIME_BUDGET = float(os.getenv("MC_TIME_BUDGET", "8"))
-MC_MAX_ITERS = int(os.getenv("MC_MAX_ITERS", "8000"))
+MC_MAX_ITERS = int(os.getenv("MC_MAX_ITERS", "30000"))
 BUY_IN_AMOUNT = int(os.getenv("BUY_IN_AMOUNT", "1500"))
 
 FULL_DECK_INTS = Deck.GetFullDeck()
