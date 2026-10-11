@@ -16,7 +16,7 @@ from treys import Card, Evaluator, Deck
 # =====================================================================
 # 1. CONFIGURATION & ENVIRONMENT
 # =====================================================================
-API_KEY = os.getenv("OPEN_POKER_API_KEY", "sO03ApKecoElfE0-GfeMQC7GI4XJ-0qjX_2vGtXXbjQ")
+API_KEY = os.getenv("OPEN_POKER_API_KEY", "")
 WS_URL = os.getenv("OPEN_POKER_WS_URL", "wss://openpoker.ai/ws")
 REST_BASE_URL = os.getenv("OPEN_POKER_REST_URL", "https://openpoker.ai")
 PORT = int(os.getenv("PORT", 10000))
