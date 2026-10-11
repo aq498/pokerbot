@@ -1,18 +1,22 @@
 name: Run OpenPoker Bot 24/7
 
 on:
-  workflow_dispatch: # Lets you click "Run workflow" manually anytime
+  workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *' # Automatically restarts every 5 hours
+    - cron: '0 */2 * * *' # Backup check every 2 hours
+
+permissions:
+  actions: write # Allows the workflow to trigger the next 2-hour run immediately
+  contents: read
 
 concurrency:
   group: openpoker-bot
-  cancel-in-progress: true # Stops the old run cleanly when a new one starts
+  cancel-in-progress: false # Prevents the backup cron from interrupting an active run
 
 jobs:
   play-poker:
     runs-on: ubuntu-latest
-    timeout-minutes: 310 # Runs for ~5 hours per cycle
+    timeout-minutes: 125 # Hard ceiling at 2h 05m
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,7 +29,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Run Bot (2-Hour Cycle)
         env:
           OPEN_POKER_API_KEY: ${{ secrets.OPEN_POKER_API_KEY }}
-        run: python bot.py || true
+        # Runs for 115 minutes (~2 hours), then stops cleanly to trigger the next run
+        run: timeout 115m python -u bot.py || true
+
+      - name: Immediately Trigger Next 2-Hour Run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run run_bot.yml
