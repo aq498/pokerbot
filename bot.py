@@ -23,8 +23,8 @@ PORT = int(os.getenv("PORT", 10000))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # Auto-injected by Render
 
 # How long to spend running Monte Carlo simulations per decision (out of 45s limit)
-MC_TIME_BUDGET = float(os.getenv("MC_TIME_BUDGET", "3.5"))
-BUY_IN_AMOUNT = int(os.getenv("BUY_IN_AMOUNT", "2000"))
+MC_TIME_BUDGET = float(os.getenv("MC_TIME_BUDGET", "8"))
+BUY_IN_AMOUNT = int(os.getenv("BUY_IN_AMOUNT", "1500"))
 
 FULL_DECK_INTS = Deck.GetFullDeck()
 
@@ -537,8 +537,6 @@ class OpenPokerClient:
                     backoff = 2
                     print("[WebSocket] Connected to OpenPoker.")
 
-                    await ws.send(json.dumps({"type": "set_auto_rebuy", "enabled": True}))
-
                     if active and active.get("playing") and active.get("table_id"):
                         self.table_id = active["table_id"]
                         print(f"[Resync] Resuming active table {self.table_id}...")
@@ -549,6 +547,8 @@ class OpenPokerClient:
                         }))
                     else:
                         await ws.send(json.dumps({"type": "join_lobby", "buy_in": BUY_IN_AMOUNT}))
+
+                    await ws.send(json.dumps({"type": "set_auto_rebuy", "enabled": True}))
 
                     async for raw_message in ws:
                         msg = json.loads(raw_message)
@@ -572,6 +572,11 @@ class OpenPokerClient:
                                     "table_id": self.table_id,
                                     "last_table_seq": 0
                                 }))
+                            elif code == "insufficient_season_chips":
+                                print("[Bankroll] Low chips detected off-table. Triggering manual rebuy...")
+                                await ws.send(json.dumps({"type": "rebuy", "amount": 0}))
+                                await asyncio.sleep(2)
+                                await ws.send(json.dumps({"type": "join_lobby", "buy_in": 1000}))
 
                         elif msg_type in ("hand_start", "new_hand"):
                             self.hands_played += 1
@@ -624,9 +629,19 @@ class OpenPokerClient:
                         elif msg_type == "your_turn":
                             await self.handle_your_turn(ws, msg)
 
+                        elif msg_type == "auto_rebuy_scheduled":
+                            wait_sec = msg.get("cooldown_seconds", 300)
+                            print(f"[Rebuy] Cooldown active. Waiting {wait_sec}s for 1,500 free chips...")
+                            await asyncio.sleep(wait_sec + 2)
+                            await ws.send(json.dumps({"type": "join_lobby", "buy_in": BUY_IN_AMOUNT}))
+
+                        elif msg_type == "rebuy_success":
+                            print("[Rebuy] Chips credited! Re-joining lobby...")
+                            await ws.send(json.dumps({"type": "join_lobby", "buy_in": BUY_IN_AMOUNT}))
+
                         elif msg_type == "busted":
-                            print("[Table] Busted! Re-joining lobby...")
-                            await asyncio.sleep(1)
+                            print("[Table] Busted! Waiting 3s for instant auto-rebuy...")
+                            await asyncio.sleep(3)
                             await ws.send(json.dumps({"type": "join_lobby", "buy_in": BUY_IN_AMOUNT}))
 
             except Exception as e:
