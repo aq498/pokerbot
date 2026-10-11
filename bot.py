@@ -5,7 +5,7 @@ import os
 import random
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import aiohttp
 from aiohttp import web
@@ -22,8 +22,9 @@ REST_BASE_URL = os.getenv("OPEN_POKER_REST_URL", "https://openpoker.ai")
 PORT = int(os.getenv("PORT", 10000))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # Auto-injected by Render
 
-# How long to spend running Monte Carlo simulations per decision (out of 45s limit)
+# Stop at 8k sims or 8s, whichever comes first
 MC_TIME_BUDGET = float(os.getenv("MC_TIME_BUDGET", "8"))
+MC_MAX_ITERS = int(os.getenv("MC_MAX_ITERS", "8000"))
 BUY_IN_AMOUNT = int(os.getenv("BUY_IN_AMOUNT", "1500"))
 
 FULL_DECK_INTS = Deck.GetFullDeck()
@@ -48,6 +49,16 @@ PREFLOP_TIER_4 = {  # Steal / Wide Defend (~38%): Open BTN/SB
     "A9o", "A8o", "A7o", "A5o", "K9o", "QTo", "JTo", "T9o", "98o"
 }
 THREE_BET_BLUFFS = {"A5s", "A4s", "A3s", "A2s", "K9s", "Q9s", "T8s", "98s", "87s", "76s"}
+FOUR_BET_VALUE = {"AA", "KK", "QQ", "AKs"}
+
+# Compact combo-class ranges (hand strings). Tiny RAM; used for MC sampling + decisions.
+RANGE_TIER = {
+    1: frozenset(PREFLOP_TIER_1),
+    2: frozenset(PREFLOP_TIER_1 | PREFLOP_TIER_2),
+    3: frozenset(PREFLOP_TIER_1 | PREFLOP_TIER_2 | PREFLOP_TIER_3),
+    4: frozenset(PREFLOP_TIER_1 | PREFLOP_TIER_2 | PREFLOP_TIER_3 | PREFLOP_TIER_4),
+}
+RANGE_VS_3BET = frozenset(PREFLOP_TIER_1 | PREFLOP_TIER_2)
 
 def cards_to_hand_str(c1: int, c2: int) -> str:
     r1, r2 = Card.get_rank_int(c1), Card.get_rank_int(c2)
@@ -69,6 +80,38 @@ def hand_preflop_tier(hand_str: str) -> int:
     if hand_str in PREFLOP_TIER_4:
         return 4
     return 5
+
+
+def classify_board(community_cards):
+    """Cheap texture tags. No lookups beyond the 3–5 board cards."""
+    info = {"paired": False, "flushy": False, "connected": False, "dry": True, "wet": False, "high": False}
+    if len(community_cards) < 3:
+        return info
+    ranks = [Card.get_rank_int(c) for c in community_cards]
+    suits = [Card.get_suit_int(c) for c in community_cards]
+    flop_ranks = ranks[:3]
+    info["paired"] = len(ranks) != len(set(ranks))
+    suit_max = Counter(suits).most_common(1)[0][1]
+    info["flushy"] = suit_max >= 3
+    two_tone = suit_max == 2
+    span = max(flop_ranks) - min(flop_ranks)
+    info["connected"] = span <= 4 and len(set(flop_ranks)) >= 2
+    info["high"] = max(ranks) >= 11
+    info["wet"] = info["flushy"] or (info["connected"] and two_tone) or (info["connected"] and not info["paired"] and info["high"])
+    info["dry"] = (not info["flushy"] and not info["connected"]) or (info["paired"] and not info["flushy"])
+    return info
+
+
+def classify_line(adj_equity: float) -> str:
+    if adj_equity >= 0.66:
+        return "value"
+    if adj_equity >= 0.40:
+        return "draw"
+    return "air"
+
+
+def empty_line_plan(hand_id=None):
+    return {"hand_id": hand_id, "line": "none", "streets_bet": 0, "flop_checked": False}
 
 # =====================================================================
 # 3. LIVE OPPONENT TRACKER (HUD)
@@ -132,14 +175,22 @@ class ComprehensivePokerEngine:
         self.evaluator = Evaluator()
         self.tracker = tracker
 
-    def sample_opponent_hand(self, available_cards, max_tier: int):
-        """Rejection-samples an opponent hand matching their estimated range tier."""
-        for _ in range(12):
-            c1, c2 = random.sample(available_cards, 2)
-            tier = hand_preflop_tier(cards_to_hand_str(c1, c2))
-            if tier <= max_tier or random.random() < 0.15:
-                return [c1, c2]
-        return random.sample(available_cards, 2)
+    def sample_opponent_hand(self, available_cards, allowed_hands):
+        """Rejection-samples a hole pair from `allowed_hands` (combo-class strings)."""
+        n = len(available_cards)
+        if n < 2:
+            return None
+        last = None
+        tries = 6 if allowed_hands is not None else 1
+        for _ in range(tries):
+            i = random.randrange(n)
+            j = random.randrange(n - 1)
+            if j >= i:
+                j += 1
+            last = [available_cards[i], available_cards[j]]
+            if allowed_hands is None or cards_to_hand_str(last[0], last[1]) in allowed_hands:
+                return last
+        return last
 
     def estimate_equity(
         self,
@@ -147,16 +198,20 @@ class ComprehensivePokerEngine:
         community_cards,
         num_opponents: int,
         opp_max_tier: int,
-        time_budget: float = MC_TIME_BUDGET
+        time_budget: float = MC_TIME_BUDGET,
+        allowed_hands=None,
     ):
         """
-        Runs Monte Carlo simulations for up to `time_budget` seconds.
+        Runs Monte Carlo until `time_budget` seconds or MC_MAX_ITERS, whichever is first.
+        All opponents are drawn from `allowed_hands` (falls back to RANGE_TIER).
         Returns (equity, iterations_completed).
         """
         if len(hole_cards) < 2:
             return 0.0, 0
 
         num_opponents = max(1, min(5, num_opponents))
+        if allowed_hands is None:
+            allowed_hands = RANGE_TIER.get(max(1, min(4, opp_max_tier)), RANGE_TIER[3])
         dead_cards = set(hole_cards) | set(community_cards)
         available = [c for c in FULL_DECK_INTS if c not in dead_cards]
         cards_to_come = 5 - len(community_cards)
@@ -165,25 +220,33 @@ class ComprehensivePokerEngine:
         iterations = 0
         deadline = time.perf_counter() + time_budget
 
-        # Check clock every 64 rollouts for minimal overhead
-        while time.perf_counter() < deadline and iterations < 25000:
-            for _ in range(64):
-                # 1. Sample primary opponent using range-filtering, others randomly
-                opp1 = self.sample_opponent_hand(available, opp_max_tier)
-                remaining = [c for c in available if c != opp1[0] and c != opp1[1]]
-                
-                needed = cards_to_come + 2 * (num_opponents - 1)
-                sampled = random.sample(remaining, needed)
-                
-                sim_board = community_cards + sampled[:cards_to_come]
+        # Check clock every 64 rollouts; stop at 8k or time budget, whichever first
+        while time.perf_counter() < deadline and iterations < MC_MAX_ITERS:
+            batch = min(64, MC_MAX_ITERS - iterations)
+            for _ in range(batch):
+                temp = available[:]
+                opp_hands = []
+                skip = False
+                for _opp in range(num_opponents):
+                    h = self.sample_opponent_hand(temp, allowed_hands)
+                    if not h:
+                        skip = True
+                        break
+                    opp_hands.append(h)
+                    try:
+                        temp.remove(h[0])
+                        temp.remove(h[1])
+                    except ValueError:
+                        skip = True
+                        break
+                if skip or len(temp) < cards_to_come:
+                    continue
+                extra = random.sample(temp, cards_to_come) if cards_to_come else []
+                sim_board = community_cards + extra
                 my_score = self.evaluator.evaluate(sim_board, hole_cards)
-
-                best_opp_score = self.evaluator.evaluate(sim_board, opp1)
-                idx = cards_to_come
-                for _ in range(num_opponents - 1):
-                    opp_hand = [sampled[idx], sampled[idx + 1]]
-                    idx += 2
-                    score = self.evaluator.evaluate(sim_board, opp_hand)
+                best_opp_score = self.evaluator.evaluate(sim_board, opp_hands[0])
+                for oh in opp_hands[1:]:
+                    score = self.evaluator.evaluate(sim_board, oh)
                     if score < best_opp_score:  # In treys, lower score = stronger hand
                         best_opp_score = score
 
@@ -253,6 +316,8 @@ class ComprehensivePokerEngine:
         big_blind = state.get("big_blind", 20)
         active_opponents = state.get("active_opponents", 1)
         opp_max_tier = state.get("opp_max_tier", 3)
+        plan = state.get("line_plan") or empty_line_plan()
+        state["line_plan"] = plan
 
         actions_map = {a["action"]: a for a in valid_actions}
         to_call = actions_map.get("call", {}).get("amount", 0)
@@ -266,116 +331,190 @@ class ComprehensivePokerEngine:
 
         hand_str = cards_to_hand_str(hole_cards[0], hole_cards[1])
         tier = hand_preflop_tier(hand_str)
+        in_position = position in ("BTN", "CO")
+        pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0.0
+        street = len(community_cards)
+        texture = classify_board(community_cards)
+
+        if street == 0 and to_call > big_blind * 4.5:
+            allowed_hands = RANGE_VS_3BET
+        elif street >= 3 and to_call > pot * 0.65:
+            allowed_hands = RANGE_TIER[max(1, min(2, opp_max_tier))]
+        else:
+            allowed_hands = RANGE_TIER.get(max(1, min(4, opp_max_tier)), RANGE_TIER[3])
 
         # -----------------------------------------------------------------
         # 1. RUN MONTE CARLO ROLLOUTS (Uses the 45s action window wisely)
         # -----------------------------------------------------------------
-        budget = MC_TIME_BUDGET if len(community_cards) >= 3 else min(1.5, MC_TIME_BUDGET * 0.5)
         equity, rollouts = self.estimate_equity(
             hole_cards=hole_cards,
             community_cards=community_cards,
             num_opponents=active_opponents,
             opp_max_tier=opp_max_tier,
-            time_budget=budget
+            time_budget=MC_TIME_BUDGET,
+            allowed_hands=allowed_hands,
         )
+        adj_equity = max(0.0, equity - 0.02 * max(0, active_opponents - 1))
+
+        def finish(desired_action, desired_amount=0):
+            a, amt = self.format_valid_action(desired_action, desired_amount, valid_actions)
+            if street >= 3:
+                aggressive = a in ("raise", "bet", "all_in")
+                if plan.get("line") in (None, "none"):
+                    plan["line"] = classify_line(adj_equity)
+                if aggressive:
+                    plan["streets_bet"] = plan.get("streets_bet", 0) + 1
+                    if adj_equity >= 0.66:
+                        plan["line"] = "value"
+                elif a == "check" and street == 3:
+                    plan["flop_checked"] = True
+                elif a == "call" and plan.get("line") == "none":
+                    plan["line"] = "draw" if adj_equity < 0.66 else "value"
+            state["line_plan"] = plan
+            return (a, amt), equity, rollouts
 
         # -----------------------------------------------------------------
         # 2. PRE-FLOP STRATEGY
         # -----------------------------------------------------------------
-        if len(community_cards) == 0:
+        if street == 0:
             stack_bb = effective_stack / big_blind if big_blind > 0 else 100
             is_unopened = (to_call <= big_blind)
+            pf_margin = 0.02 if in_position else (0.03 if position == "BB" else 0.06)
+            pf_required = pot_odds + pf_margin
+            pf_stack_ok = to_call <= effective_stack * (0.12 if (in_position or position == "BB") else 0.08)
 
-            # Short-stack Push/Fold (< 14 BB)
             if stack_bb <= 14:
                 if tier <= 2 or (tier == 3 and position in ("BTN", "SB", "CO")):
-                    return self.format_valid_action("raise", max_raise, valid_actions), equity, rollouts
-                return self.format_valid_action("check" if to_call == 0 else "fold", 0, valid_actions), equity, rollouts
+                    return finish("raise", max_raise)
+                return finish("check" if to_call == 0 else "fold", 0)
 
-            # Unopened Pot / Limped Pot
             if is_unopened:
                 open_size = int(big_blind * 2.5) if to_call <= big_blind else int(pot + big_blind * 2)
                 if position in ("UTG", "MP") and tier <= 2:
-                    return self.format_valid_action("raise", open_size, valid_actions), equity, rollouts
+                    return finish("raise", open_size)
                 if position == "CO" and tier <= 3:
-                    return self.format_valid_action("raise", open_size, valid_actions), equity, rollouts
+                    return finish("raise", open_size)
                 if position in ("BTN", "SB") and tier <= 4:
-                    return self.format_valid_action("raise", open_size, valid_actions), equity, rollouts
+                    return finish("raise", open_size)
                 if position == "BB":
                     if tier <= 2:
-                        return self.format_valid_action("raise", int(big_blind * 3), valid_actions), equity, rollouts
-                    return self.format_valid_action("check" if to_call == 0 else "call", 0, valid_actions), equity, rollouts
+                        return finish("raise", int(big_blind * 3))
+                    return finish("check" if to_call == 0 else "call", 0)
                 if position == "SB" and to_call <= big_blind // 2 and tier <= 4:
-                    return self.format_valid_action("call", to_call, valid_actions), equity, rollouts
-                return self.format_valid_action("check" if to_call == 0 else "fold", 0, valid_actions), equity, rollouts
+                    return finish("call", to_call)
+                return finish("check" if to_call == 0 else "fold", 0)
 
-            # Facing a Single Raise (to_call <= 4.5 BB)
-            if to_call <= big_blind * 4.5:
-                three_bet_size = int(to_call * 3.0 if position in ("BTN", "CO") else to_call * 3.5)
-                if tier == 1:
-                    return self.format_valid_action("raise", three_bet_size, valid_actions), equity, rollouts
-                if tier == 2:
-                    if random.random() < 0.35:
-                        return self.format_valid_action("raise", three_bet_size, valid_actions), equity, rollouts
-                    return self.format_valid_action("call", to_call, valid_actions), equity, rollouts
-                if hand_str in THREE_BET_BLUFFS and position in ("BTN", "CO", "SB") and random.random() < 0.20:
-                    return self.format_valid_action("raise", three_bet_size, valid_actions), equity, rollouts
-                if tier == 3 and position in ("BTN", "CO", "BB") and to_call <= effective_stack * 0.08:
-                    return self.format_valid_action("call", to_call, valid_actions), equity, rollouts
-                return self.format_valid_action("fold", 0, valid_actions), equity, rollouts
+            # Facing a 4-bet: continue only with true value
+            if to_call > big_blind * 8:
+                if hand_str in FOUR_BET_VALUE:
+                    return finish("raise", max_raise)
+                if tier == 1 and pf_stack_ok:
+                    return finish("call", to_call)
+                return finish("fold", 0)
 
-            # Facing a 3-Bet or 4-Bet (to_call > 4.5 BB)
+            three_bet_size = int(to_call * (3.0 if in_position else 3.5))
             if tier == 1:
-                if hand_str in ("AA", "KK", "AKs") or to_call >= effective_stack * 0.35:
-                    return self.format_valid_action("raise", int(to_call * 2.4), valid_actions), equity, rollouts
-                return self.format_valid_action("call", to_call, valid_actions), equity, rollouts
-            if tier == 2 and to_call <= effective_stack * 0.15 and equity >= 0.46:
-                return self.format_valid_action("call", to_call, valid_actions), equity, rollouts
-            return self.format_valid_action("fold", 0, valid_actions), equity, rollouts
+                if to_call > big_blind * 4.5 and (
+                    hand_str in FOUR_BET_VALUE or to_call >= effective_stack * 0.35
+                ):
+                    return finish("raise", int(to_call * 2.4))
+                if to_call <= big_blind * 4.5:
+                    return finish("raise", three_bet_size)
+                return finish("call", to_call)
+            if to_call <= big_blind * 4.5:
+                if tier == 2 and random.random() < 0.35:
+                    return finish("raise", three_bet_size)
+                if hand_str in THREE_BET_BLUFFS and position in ("BTN", "CO", "SB") and random.random() < 0.20:
+                    return finish("raise", three_bet_size)
+
+            if adj_equity >= pf_required and pf_stack_ok and tier <= (3 if (in_position or position == "BB") else 2):
+                return finish("call", to_call)
+            return finish("fold", 0)
 
         # -----------------------------------------------------------------
-        # 3. POST-FLOP STRATEGY (Monte Carlo Equity + SPR + Pot Odds)
+        # 3. POST-FLOP (texture + street plan + pot odds)
         # -----------------------------------------------------------------
-        pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0.0
         spr = effective_stack / max(1, pot)
-        street = len(community_cards)  # 3=Flop, 4=Turn, 5=River
+        line = plan.get("line") or "none"
 
-        # Scenario A: Checked to us (to_call == 0)
+        def size_for(line_name):
+            if line_name == "air":
+                frac = 0.33 if texture["dry"] else 0.55
+            elif texture["wet"] or street == 5:
+                frac = 0.75 if line_name == "value" else 0.55
+            elif texture["dry"]:
+                frac = 0.33
+            else:
+                frac = 0.50
+            return int(max(1, pot * frac))
+
         if to_call == 0:
-            if equity >= 0.72:
-                # Monster/Strong value bet: size larger on wet boards or high equity
-                bet_size = int(pot * (0.75 if street < 5 else 0.80))
-                return self.format_valid_action("raise", bet_size, valid_actions), equity, rollouts
-            elif equity >= 0.56:
-                # Medium-strong value / protection bet
-                bet_size = int(pot * 0.50)
-                return self.format_valid_action("raise", bet_size, valid_actions), equity, rollouts
-            elif street == 3 and equity >= 0.42 and position in ("BTN", "CO") and random.random() < 0.45:
-                # Semi-bluff / Range c-bet in position on the Flop with strong draws
-                bet_size = int(pot * 0.35)
-                return self.format_valid_action("raise", bet_size, valid_actions), equity, rollouts
-            return self.format_valid_action("check", 0, valid_actions), equity, rollouts
+            if line == "air":
+                if street >= 5:
+                    return finish("check", 0)
+                if texture["dry"] and in_position and plan.get("streets_bet", 0) == 1 and random.random() < 0.30:
+                    return finish("raise", size_for("air"))
+                return finish("check", 0)
+            if line == "draw":
+                if adj_equity >= 0.62:
+                    return finish("raise", size_for("value"))
+                if street == 4 and in_position and adj_equity >= 0.38:
+                    return finish("raise", size_for("draw"))
+                return finish("check", 0)
+            if line == "value" and adj_equity >= 0.55:
+                return finish("raise", size_for("value"))
 
-        # Scenario B: Facing a Bet/Raise (to_call > 0)
-        else:
-            # Required equity margin scales slightly by street to avoid bleeding on the river
-            safety_margin = 0.03 if street == 3 else (0.05 if street == 4 else 0.07)
-            required_equity = pot_odds + safety_margin
+            if adj_equity >= 0.72:
+                return finish("raise", size_for("value"))
+            if adj_equity >= (0.52 if in_position else 0.60):
+                return finish("raise", size_for("value"))
+            if street == 3 and in_position and texture["dry"] and adj_equity >= 0.32 and random.random() < 0.70:
+                return finish("raise", size_for("air"))
+            if street == 3 and in_position and texture["wet"] and adj_equity >= 0.48 and random.random() < 0.40:
+                return finish("raise", size_for("draw"))
+            if street == 4 and plan.get("flop_checked") and in_position and texture["dry"] and adj_equity >= 0.40:
+                return finish("raise", size_for("value"))
+            return finish("check", 0)
 
-            # Jam or Raise for value with high equity
-            if equity >= 0.78 or (equity >= 0.68 and spr <= 2.0):
-                raise_target = max_raise if spr <= 2.5 else int(pot + to_call * 2.5)
-                return self.format_valid_action("raise", raise_target, valid_actions), equity, rollouts
+        street_margin = 0.03 if street == 3 else (0.05 if street == 4 else 0.07)
+        if texture["wet"]:
+            street_margin += 0.02
+        if texture["dry"]:
+            street_margin -= 0.01
+        pos_margin = 0.0 if in_position else 0.04
+        size_margin = 0.03 if to_call > pot * 0.65 else 0.0
+        required_equity = pot_odds + street_margin + pos_margin + size_margin
 
-            # Standard +EV Call (includes strong flush/straight draws on Flop/Turn)
-            if equity >= required_equity:
-                return self.format_valid_action("call", to_call, valid_actions), equity, rollouts
+        if line == "air" and adj_equity < required_equity + 0.03:
+            return finish("fold", 0)
 
-            # Implied-odds call on the Flop with big draws when deep-stacked
-            if street == 3 and equity >= (pot_odds - 0.04) and to_call <= pot * 0.5 and spr >= 4.0:
-                return self.format_valid_action("call", to_call, valid_actions), equity, rollouts
+        if plan.get("flop_checked") and adj_equity >= 0.70 and to_call <= pot * 0.6:
+            return finish("raise", int(pot + to_call * 2.2))
+        if street == 3 and (not in_position) and adj_equity >= 0.44 and texture["wet"] and to_call <= pot * 0.45 and random.random() < 0.18:
+            return finish("raise", int(pot * 0.7 + to_call))
 
-            return self.format_valid_action("fold", 0, valid_actions), equity, rollouts
+        if adj_equity >= 0.78 or (adj_equity >= 0.68 and spr <= 2.0):
+            raise_target = max_raise if spr <= 2.5 else int(pot + to_call * 2.5)
+            return finish("raise", raise_target)
+
+        if street == 3 and in_position and to_call <= pot * 0.4 and adj_equity >= max(0.0, pot_odds - 0.02):
+            plan["line"] = "draw"
+            return finish("call", to_call)
+
+        if adj_equity >= required_equity:
+            return finish("call", to_call)
+
+        impl_need = pot_odds - (0.05 if in_position else 0.02)
+        if (
+            street == 3
+            and adj_equity >= impl_need
+            and to_call <= pot * (0.55 if in_position else 0.40)
+            and spr >= 4.0
+        ):
+            plan["line"] = "draw"
+            return finish("call", to_call)
+
+        return finish("fold", 0)
 
 
 # =====================================================================
@@ -397,6 +536,7 @@ class OpenPokerClient:
         self.players = []
         self.folded_seats = set()
         self.last_aggressor_id = None
+        self.line_plan = empty_line_plan()
 
         # Telemetry for the Render status page
         self.hands_played = 0
@@ -464,6 +604,9 @@ class OpenPokerClient:
         players = msg.get("players", self.players)
         position = self.get_my_position(my_seat, players)
 
+        if self.line_plan.get("hand_id") != hand_id:
+            self.line_plan = empty_line_plan(hand_id)
+
         # Estimate active opponents and aggressor tightness
         total_players = len(players) if players else 6
         active_opponents = max(1, total_players - len(self.folded_seats) - 1)
@@ -486,11 +629,13 @@ class OpenPokerClient:
             "stack": msg.get("max_raise", msg.get("stack", 2000)),
             "active_opponents": active_opponents,
             "opp_max_tier": opp_max_tier,
+            "line_plan": self.line_plan,
         }
 
         t0 = time.perf_counter()
         # Run heavy Monte Carlo rollouts in a worker thread so the event loop stays responsive
         (action, amount), equity, rollouts = await asyncio.to_thread(self.engine.decide, state)
+        self.line_plan = state.get("line_plan", self.line_plan)
         elapsed = time.perf_counter() - t0
 
         payload = {
@@ -584,6 +729,7 @@ class OpenPokerClient:
                             self.community_cards = []
                             self.folded_seats.clear()
                             self.last_aggressor_id = None
+                            self.line_plan = empty_line_plan(msg.get("hand_id"))
                             self.dealer_seat = msg.get("dealer_seat", msg.get("button_seat", 0))
                             self.players = msg.get("players", self.players)
                             self.tracker.start_new_hand(self.players)
