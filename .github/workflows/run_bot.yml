@@ -1,0 +1,31 @@
+name: Run OpenPoker Bot 24/7
+
+on:
+  workflow_dispatch: # Lets you click "Run workflow" manually anytime
+  schedule:
+    - cron: '0 */5 * * *' # Automatically restarts every 5 hours
+
+concurrency:
+  group: openpoker-bot
+  cancel-in-progress: true # Stops the old run cleanly when a new one starts
+
+jobs:
+  play-poker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 310 # Runs for ~5 hours per cycle
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Bot
+        env:
+          OPEN_POKER_API_KEY: ${{ secrets.OPEN_POKER_API_KEY }}
+        run: python bot.py || true
