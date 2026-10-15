@@ -36,7 +36,8 @@ jobs:
         run: timeout 115m python -u bot.py || true
 
       - name: Immediately Trigger Next 2-Hour Run
-        if: always()
+        # Change from always() to prevent looping on manual cancellations
+        if: success() || failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run run_bot.yml
